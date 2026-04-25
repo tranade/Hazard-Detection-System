@@ -6,8 +6,8 @@ import numpy as np
 from ultralytics import YOLO
 
 # Hardcoded stereo calibration defaults from your dataset
-DEFAULT_FOCAL_PX = 711.499
-DEFAULT_BASELINE_M = 0.0599432
+DEFAULT_FOCAL_PX = 900 #711.499
+DEFAULT_BASELINE_M =  0.05 #0.072000 #0.0599432
 
 
 def resolve_existing_path(raw_path: str) -> Path:
