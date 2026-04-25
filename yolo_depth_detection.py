@@ -6,8 +6,8 @@ import numpy as np
 from ultralytics import YOLO
 
 # Hardcoded stereo calibration defaults from your dataset
-DEFAULT_FOCAL_PX = 900 #711.499
-DEFAULT_BASELINE_M =  0.05 #0.072000 #0.0599432
+DEFAULT_FOCAL_PX = 411 #711.499
+DEFAULT_BASELINE_M =  0.018 #0.072000 #0.0599432
 
 
 def resolve_existing_path(raw_path: str) -> Path:
@@ -74,8 +74,8 @@ def disparity_to_colormap(disparity: np.ndarray):
 def detect_objects_and_disparity(
     left_image_path: str,
     right_image_path: str | None,
-    model_path: str = "yolov8n-seg.pt",
-    conf_threshold: float = 0.35,
+    model_path: str = "yolo11n-seg.pt",
+    conf_threshold: float = 0.1,
     focal_px: float | None = None,
     baseline_m: float | None = None,
 ):
@@ -203,13 +203,13 @@ def build_arg_parser():
     )
     parser.add_argument(
         "--model",
-        default="yolov8n-seg.pt",
+        default="yolo11n-seg.pt",
         help="YOLO segmentation model path or name.",
     )
     parser.add_argument(
         "--conf",
         type=float,
-        default=0.35,
+        default=0.2,
         help="Confidence threshold.",
     )
     parser.add_argument(
