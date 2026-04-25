@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hazard-cv"
+version = "0.1.0"
+description = "Geometric hazard cues with ETH3D calibration and depth evaluation"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.24",
+  "opencv-python-headless>=4.8",
+  "scipy>=1.11",
+  "pyttsx3>=2.90",
+]
+
+[project.optional-dependencies]
+semantics = ["ultralytics>=8.0"]
+dev = ["pytest>=7.0"]
+data = ["py7zr>=0.20"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[project.scripts]
+hazard-cv = "hazard_cv.cli:main"
+hazard-pair = "hazard_cv.pair_stereo:main"

@@ -1,0 +1,12 @@
+{
+  "labels": [
+    {
+      "image": "im0",
+      "u": 320,
+      "v": 240,
+      "radius": 40,
+      "level": "medium",
+      "note": "Replace with real stems (filename without extension) after you pick ETH3D frames."
+    }
+  ]
+}

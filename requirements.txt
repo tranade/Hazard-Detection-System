@@ -1,0 +1,7 @@
+numpy>=1.24
+opencv-python-headless>=4.8
+scipy>=1.11
+pyttsx3>=2.90
+
+# Optional: semantic / YOLO head (install if you use optional detector)
+# ultralytics>=8.0
