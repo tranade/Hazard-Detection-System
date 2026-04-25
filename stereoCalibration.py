@@ -3,6 +3,7 @@ import cv2
 import matplotlib.pyplot as plt
 import os
 from scipy.spatial.transform import Rotation
+from ultralytics import YOLO
 
 
 # COLMAP loaders
@@ -14,7 +15,7 @@ def load_cameras(path):
             if line.startswith("#") or not line.strip():
                 continue
             parts = line.split()
-            cam_id = int(parts[0])
+            cam_id = int(parts[0])  
             model  = parts[1]
             w, h   = int(parts[2]), int(parts[3])
             params = list(map(float, parts[4:]))
@@ -209,16 +210,100 @@ def disparity_to_depth(disparity, f, baseline):
     return depth.astype(np.float32)
 
 
+def nearest_depth_from_mask(depth_map, mask):
+    """Closest valid depth value inside a boolean mask."""
+    valid = mask & np.isfinite(depth_map) & (depth_map > 0)
+    if not np.any(valid):
+        return None
+    return float(np.nanmin(depth_map[valid]))
+
+
+def segment_and_measure_depth(rectified_left, depth_map, model_name="yolov8n-seg.pt", conf=0.35):
+    """
+    Run YOLO segmentation on rectified left image and report nearest depth
+    for each object using only pixels inside each object mask.
+    """
+    model = YOLO(model_name)
+    result = model.predict(rectified_left, conf=conf, verbose=False)[0]
+    overlay = rectified_left.copy()
+    measurements = []
+    combined_mask = np.zeros(depth_map.shape, dtype=bool)
+
+    if result.masks is None:
+        masked_depth = np.full_like(depth_map, np.nan, dtype=np.float32)
+        return overlay, measurements, masked_depth
+
+    masks = result.masks.data.cpu().numpy()
+    classes = result.boxes.cls.cpu().numpy().astype(int)
+    scores = result.boxes.conf.cpu().numpy()
+
+    for i, raw_mask in enumerate(masks):
+        mask = raw_mask > 0.5
+        combined_mask |= mask
+        nearest_m = nearest_depth_from_mask(depth_map, mask)
+        label = model.names.get(classes[i], str(classes[i]))
+        score = float(scores[i])
+
+        # blend segmentation mask on image for visualization
+        color = (0, 255, 0)
+        overlay[mask] = (0.65 * overlay[mask] + 0.35 * np.array(color)).astype(np.uint8)
+
+        ys, xs = np.where(mask)
+        if len(xs) == 0:
+            continue
+
+        x1, x2 = int(np.min(xs)), int(np.max(xs))
+        y1, y2 = int(np.min(ys)), int(np.max(ys))
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 2)
+
+        if nearest_m is None:
+            text = f"{label} {score:.2f} | no depth"
+        else:
+            text = f"{label} {score:.2f} | {nearest_m:.2f} m"
+            measurements.append(
+                {"class": label, "confidence": score, "nearest_depth_m": nearest_m}
+            )
+
+        cv2.putText(
+            overlay,
+            text,
+            (x1, max(20, y1 - 8)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+    masked_depth = np.where(combined_mask, depth_map, np.nan).astype(np.float32)
+    return overlay, measurements, masked_depth
+
+
 # visualize 
 
-def visualise(img_rgb, depth_map, rect1=None, rect2=None, disp=None):
+def visualise(
+    img_rgb,
+    depth_map,
+    rect1=None,
+    rect2=None,
+    disp=None,
+    seg_overlay=None,
+    masked_depth=None,
+):
     valid  = np.isfinite(depth_map) & (depth_map > 0)
     d_vis  = np.full_like(depth_map, np.nan)
     if valid.any():
         lo, hi = np.percentile(depth_map[valid], [2, 98])
         d_vis  = np.clip(depth_map, lo, hi)
 
-    n_cols  = 4 if (rect1 is not None) else 2
+    if rect1 is not None and seg_overlay is not None and masked_depth is not None:
+        n_cols = 6
+    elif rect1 is not None and seg_overlay is not None:
+        n_cols = 5
+    elif rect1 is not None:
+        n_cols = 4
+    else:
+        n_cols = 2
     fig, ax = plt.subplots(1, n_cols, figsize=(5 * n_cols, 5))
 
     ax[0].imshow(img_rgb);           ax[0].set_title("Reference Image");   ax[0].axis("off")
@@ -231,6 +316,17 @@ def visualise(img_rgb, depth_map, rect1=None, rect2=None, disp=None):
         ax[2].set_title("Rectified Left");  ax[2].axis("off")
         ax[3].imshow(disp, cmap="jet")
         ax[3].set_title("Disparity");       ax[3].axis("off")
+        if seg_overlay is not None:
+            ax[4].imshow(cv2.cvtColor(seg_overlay, cv2.COLOR_BGR2RGB))
+            ax[4].set_title("YOLO Seg + Nearest Depth"); ax[4].axis("off")
+            if masked_depth is not None:
+                md_valid = np.isfinite(masked_depth) & (masked_depth > 0)
+                md_vis = np.full_like(masked_depth, np.nan)
+                if md_valid.any():
+                    md_lo, md_hi = np.percentile(masked_depth[md_valid], [2, 98])
+                    md_vis = np.clip(masked_depth, md_lo, md_hi)
+                ax[5].imshow(md_vis, cmap="plasma")
+                ax[5].set_title("Depth In YOLO Masks Only"); ax[5].axis("off")
 
     plt.tight_layout()
     plt.show()
@@ -294,9 +390,29 @@ def main():
     if valid.any():
         print(f"  depth range: {np.nanmin(depth[valid]):.2f} m … {np.nanmax(depth[valid]):.2f} m")
 
-    # visualize 
+    # YOLO segmentation + nearest depth per object mask
+    print("Running YOLO segmentation on rectified left image …")
+    seg_overlay, measurements, masked_depth = segment_and_measure_depth(
+        rect1, depth, model_name="yolov8n-seg.pt", conf=0.35
+    )
+    if measurements:
+        print("Nearest object depths from segmentation masks:")
+        for m in measurements:
+            print(f"  - {m['class']}: {m['nearest_depth_m']:.2f} m (conf {m['confidence']:.2f})")
+    else:
+        print("  No segmented objects with valid depth.")
+
+    # visualize
     ref_rgb = cv2.cvtColor(img1, cv2.COLOR_BGR2RGB)
-    visualise(ref_rgb, depth, rect1=rect1, rect2=rect2, disp=disp)
+    visualise(
+        ref_rgb,
+        depth,
+        rect1=rect1,
+        rect2=rect2,
+        disp=disp,
+        seg_overlay=seg_overlay,
+        masked_depth=masked_depth,
+    )
 
 
 if __name__ == "__main__":
