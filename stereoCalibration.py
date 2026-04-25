@@ -5,7 +5,7 @@ import os
 from scipy.spatial.transform import Rotation
 
 
-# ── COLMAP loaders
+# COLMAP loaders
 
 def load_cameras(path):
     cameras = {}
