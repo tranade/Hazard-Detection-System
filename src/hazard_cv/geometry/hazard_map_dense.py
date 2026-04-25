@@ -17,17 +17,35 @@ def build_hazard_heatmap(
     width: int,
     corners: List[CornerHazard],
     sigma_px: float = 45.0,
+    corner_weights: np.ndarray | None = None,
 ) -> np.ndarray:
     """
-    Return float32 HxW in [0,1]: splatted sum of per-level weights with Gaussian falloff.
+    Return float32 HxW in [0,1]: splatted hazard with Gaussian falloff.
+
+    Weighting is proximity-first:
+    - disparity proximity drives most of the hazard weight
+    - corner severity provides an additional boost
+    This enforces: near objects > far objects, and near+sharp corners are strongest.
     """
     h = np.zeros((height, width), dtype=np.float32)
     if not corners or sigma_px <= 0:
         return h
     sig2 = 2.0 * float(sigma_px) ** 2
     yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
-    for c in corners:
-        w0 = _LEVEL_WEIGHT.get(c.level, 0.3)
+    if corner_weights is None:
+        weights = np.ones((len(corners),), dtype=np.float32)
+    else:
+        weights = np.asarray(corner_weights, dtype=np.float32)
+        if weights.shape[0] != len(corners):
+            raise ValueError("corner_weights must have same length as corners")
+        weights = np.clip(weights, 0.0, 1.0)
+    for c, prox_w in zip(corners, weights):
+        level_w = _LEVEL_WEIGHT.get(c.level, 0.3)
+        prox = float(np.clip(prox_w, 0.0, 1.0))
+        # Proximity dominates; corner level amplifies the close hazards.
+        base = 0.85 * prox + 0.15 * level_w
+        synergy = 1.0 + 0.45 * prox * level_w
+        w0 = float(np.clip(base * synergy, 0.0, 1.5))
         dy = yy - c.v
         dx = xx - c.u
         g = np.exp(-(dx * dx + dy * dy) / sig2) * w0
