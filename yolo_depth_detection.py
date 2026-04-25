@@ -1,13 +1,14 @@
 import argparse
+import json
 from pathlib import Path
 
 import cv2
 import numpy as np
 from ultralytics import YOLO
 
-# Hardcoded stereo calibration defaults from your dataset
-DEFAULT_FOCAL_PX = 411 #711.499
-DEFAULT_BASELINE_M =  0.018 #0.072000 #0.0599432
+# Fallback values if no calibration file is provided/found.
+DEFAULT_FOCAL_PX = 411.0
+DEFAULT_BASELINE_M = 0.018
 DEFAULT_PRINCIPAL_X = 320.818
 
 
@@ -27,6 +28,50 @@ def load_bgr_image(path_str: str):
     if image is None:
         raise FileNotFoundError(f"Could not read image: {file_path}")
     return image
+
+
+def load_calibration_npz(calibration_path: str):
+    cal_path = resolve_existing_path(calibration_path)
+    with np.load(str(cal_path)) as data:
+        required = ("K_left", "T")
+        missing = [k for k in required if k not in data]
+        if missing:
+            raise KeyError(
+                f"Calibration file is missing keys: {missing}. "
+                "Expected at least K_left and T."
+            )
+
+        k_left = data["K_left"].astype(np.float64)
+        t = data["T"].astype(np.float64).reshape(-1)
+
+        focal_px = float(k_left[0, 0])
+        principal_x = float(k_left[0, 2])
+        baseline_m = float(np.linalg.norm(t))
+
+        return {
+            "path": cal_path,
+            "focal_px": focal_px,
+            "principal_x": principal_x,
+            "baseline_m": baseline_m,
+        }
+
+
+def load_depth_params_json(params_path: str):
+    file_path = resolve_existing_path(params_path)
+    payload = json.loads(file_path.read_text(encoding="utf-8"))
+    required = ("focal_px", "principal_x", "baseline_m")
+    missing = [k for k in required if k not in payload]
+    if missing:
+        raise KeyError(
+            f"Depth params file is missing keys: {missing}. "
+            "Expected focal_px, principal_x, baseline_m."
+        )
+    return {
+        "path": file_path,
+        "focal_px": float(payload["focal_px"]),
+        "principal_x": float(payload["principal_x"]),
+        "baseline_m": float(payload["baseline_m"]),
+    }
 
 
 def compute_disparity(left_bgr: np.ndarray, right_bgr: np.ndarray):
@@ -246,20 +291,36 @@ def build_arg_parser():
     parser.add_argument(
         "--focal-px",
         type=float,
-        default=DEFAULT_FOCAL_PX,
-        help="Stereo focal length in pixels. Needed for metric depth (meters).",
+        default=None,
+        help="Stereo focal length in pixels. Overrides calibration file if provided.",
     )
     parser.add_argument(
         "--baseline-m",
         type=float,
-        default=DEFAULT_BASELINE_M,
-        help="Stereo baseline in meters. Needed for metric depth (meters).",
+        default=None,
+        help="Stereo baseline in meters. Overrides calibration file if provided.",
     )
     parser.add_argument(
         "--principal-x",
         type=float,
-        default=DEFAULT_PRINCIPAL_X,
-        help="Principal point x (cx) in pixels for bearing-angle calculation.",
+        default=None,
+        help="Principal point x (cx) in pixels. Overrides calibration file if provided.",
+    )
+    parser.add_argument(
+        "--params-file",
+        default="depth_params.json",
+        help=(
+            "Intermediate JSON file with focal_px/principal_x/baseline_m "
+            "(produced by export_depth_params.py). Set empty string to skip."
+        ),
+    )
+    parser.add_argument(
+        "--calibration",
+        default="camera_calibration.npz",
+        help=(
+            "Optional fallback calibration .npz if params-file is missing/disabled. "
+            "Set to an empty string to skip loading."
+        ),
     )
     parser.add_argument(
         "--show",
@@ -271,14 +332,66 @@ def build_arg_parser():
 
 def main():
     args = build_arg_parser().parse_args()
+
+    calib = None
+    if args.params_file is not None and str(args.params_file).strip() != "":
+        try:
+            calib = load_depth_params_json(args.params_file)
+            print(
+                f"Loaded depth params from: {calib['path']} "
+                f"(fx={calib['focal_px']:.3f}px, cx={calib['principal_x']:.3f}px, baseline={calib['baseline_m']:.6f}m)"
+            )
+        except FileNotFoundError:
+            calib = None
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load params file '{args.params_file}': {exc}"
+            ) from exc
+
+    if calib is None and args.calibration is not None and str(args.calibration).strip() != "":
+        try:
+            calib = load_calibration_npz(args.calibration)
+            print(
+                f"Loaded fallback calibration from: {calib['path']} "
+                f"(fx={calib['focal_px']:.3f}px, cx={calib['principal_x']:.3f}px, baseline={calib['baseline_m']:.6f}m)"
+            )
+        except FileNotFoundError:
+            calib = None
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load calibration file '{args.calibration}': {exc}"
+            ) from exc
+
+    focal_px = args.focal_px
+    baseline_m = args.baseline_m
+    principal_x = args.principal_x
+    if calib is not None:
+        if focal_px is None:
+            focal_px = calib["focal_px"]
+        if baseline_m is None:
+            baseline_m = calib["baseline_m"]
+        if principal_x is None:
+            principal_x = calib["principal_x"]
+
+    if focal_px is None:
+        focal_px = DEFAULT_FOCAL_PX
+    if baseline_m is None:
+        baseline_m = DEFAULT_BASELINE_M
+    if principal_x is None:
+        principal_x = DEFAULT_PRINCIPAL_X
+
     annotated, detections, disparity_vis, masked_disparity_vis, depth_map_m = detect_objects_and_disparity(
         left_image_path=args.image,
         right_image_path=args.right_image,
         model_path=args.model,
         conf_threshold=args.conf,
-        focal_px=args.focal_px,
-        baseline_m=args.baseline_m,
-        principal_x=args.principal_x,
+        focal_px=focal_px,
+        baseline_m=baseline_m,
+        principal_x=principal_x,
+    )
+
+    print(
+        f"Using intrinsics/extrinsics: focal_px={focal_px:.3f}, principal_x={principal_x:.3f}, baseline_m={baseline_m:.6f}"
     )
 
     output_path = Path(args.output)

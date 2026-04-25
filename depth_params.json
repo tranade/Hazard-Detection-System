@@ -1,0 +1,6 @@
+{
+  "source_calibration": "/Users/tanviranade/Tanvi/Hopkins/Spring-2026/Hazard-Detection-System/camera_calibration.npz",
+  "focal_px": 390.0480446893816,
+  "principal_x": 328.0430154076484,
+  "baseline_m": 0.018
+}
