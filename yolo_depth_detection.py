@@ -8,6 +8,7 @@ from ultralytics import YOLO
 # Hardcoded stereo calibration defaults from your dataset
 DEFAULT_FOCAL_PX = 411 #711.499
 DEFAULT_BASELINE_M =  0.018 #0.072000 #0.0599432
+DEFAULT_PRINCIPAL_X = 320.818
 
 
 def resolve_existing_path(raw_path: str) -> Path:
@@ -78,6 +79,7 @@ def detect_objects_and_disparity(
     conf_threshold: float = 0.1,
     focal_px: float | None = None,
     baseline_m: float | None = None,
+    principal_x: float = DEFAULT_PRINCIPAL_X,
 ):
     left_img = load_bgr_image(left_image_path)
     right_img = load_bgr_image(right_image_path) if right_image_path else None
@@ -134,6 +136,10 @@ def detect_objects_and_disparity(
                     "bbox_xyxy": [int(x1), int(y1), int(x2), int(y2)],
                 }
             )
+            use_fx = focal_px if focal_px is not None else DEFAULT_FOCAL_PX
+            obj_center_x = 0.5 * (x1 + x2)
+            bearing_deg = float(np.degrees(np.arctan2((obj_center_x - principal_x), use_fx)))
+            detections[-1]["bearing_deg"] = bearing_deg
 
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
             cv2.putText(
@@ -143,6 +149,16 @@ def detect_objects_and_disparity(
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.6,
                 color,
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                annotated,
+                f"angle {bearing_deg:+.1f} deg",
+                (x1, y1 + 44),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (255, 255, 255),
                 2,
                 cv2.LINE_AA,
             )
@@ -240,6 +256,12 @@ def build_arg_parser():
         help="Stereo baseline in meters. Needed for metric depth (meters).",
     )
     parser.add_argument(
+        "--principal-x",
+        type=float,
+        default=DEFAULT_PRINCIPAL_X,
+        help="Principal point x (cx) in pixels for bearing-angle calculation.",
+    )
+    parser.add_argument(
         "--show",
         action="store_true",
         help="Display result window.",
@@ -256,6 +278,7 @@ def main():
         conf_threshold=args.conf,
         focal_px=args.focal_px,
         baseline_m=args.baseline_m,
+        principal_x=args.principal_x,
     )
 
     output_path = Path(args.output)
@@ -267,13 +290,15 @@ def main():
         print("Detections:")
         for d in detections:
             closest_depth = d.get("closest_depth_m", None)
+            bearing_deg = d.get("bearing_deg", None)
+            bearing_txt = f"angle={bearing_deg:+.2f} deg | " if bearing_deg is not None else ""
             if closest_depth is None:
                 print(
-                    f"  - {d['class']} | conf={d['confidence']:.2f} | bbox={d['bbox_xyxy']}"
+                    f"  - {d['class']} | conf={d['confidence']:.2f} | {bearing_txt}bbox={d['bbox_xyxy']}"
                 )
             else:
                 print(
-                    f"  - {d['class']} | conf={d['confidence']:.2f} | closest_depth={closest_depth:.2f} m | bbox={d['bbox_xyxy']}"
+                    f"  - {d['class']} | conf={d['confidence']:.2f} | {bearing_txt}closest_depth={closest_depth:.2f} m | bbox={d['bbox_xyxy']}"
                 )
     else:
         print("No objects detected.")
