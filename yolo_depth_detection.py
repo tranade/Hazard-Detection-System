@@ -6,6 +6,11 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
+try:
+    import pyttsx3
+except Exception:  # pragma: no cover - optional runtime dependency
+    pyttsx3 = None
+
 # Fallback values if no calibration file is provided/found.
 DEFAULT_FOCAL_PX = 411.0
 DEFAULT_BASELINE_M = 0.018
@@ -115,6 +120,102 @@ def disparity_to_colormap(disparity: np.ndarray):
     vis[valid] = (clipped[valid] - lo) / max(hi - lo, 1e-6)
     vis_u8 = (vis * 255).astype(np.uint8)
     return cv2.applyColorMap(vis_u8, cv2.COLORMAP_TURBO)
+
+
+def bearing_to_direction(bearing_deg: float, deadzone_deg: float = 7.5) -> str:
+    if abs(bearing_deg) <= deadzone_deg:
+        return "ahead"
+    if bearing_deg < 0:
+        return "to your left"
+    return "to your right"
+
+
+def choose_path_instruction(detections: list[dict]) -> str:
+    with_depth = [
+        d for d in detections if d.get("closest_depth_m") is not None and d.get("bearing_deg") is not None
+    ]
+    if not with_depth:
+        return "straight"
+
+    front_min = float("inf")
+    left_min = float("inf")
+    right_min = float("inf")
+    for det in with_depth:
+        depth = float(det["closest_depth_m"])
+        bearing = float(det["bearing_deg"])
+        if abs(bearing) <= 7.5:
+            front_min = min(front_min, depth)
+        elif bearing < 0:
+            left_min = min(left_min, depth)
+        else:
+            right_min = min(right_min, depth)
+
+    front_blocked = front_min < 1.5
+    left_blocked = left_min < 1.2
+    right_blocked = right_min < 1.2
+
+    if front_blocked:
+        if (left_min > right_min) and not left_blocked:
+            return "left"
+        if (right_min >= left_min) and not right_blocked:
+            return "right"
+        return "turn around"
+
+    if left_blocked and not right_blocked:
+        return "right"
+    if right_blocked and not left_blocked:
+        return "left"
+    return "straight"
+
+
+def pick_closest_detections(detections: list[dict], limit: int = 2) -> list[dict]:
+    with_depth = [d for d in detections if d.get("closest_depth_m") is not None]
+    with_depth.sort(key=lambda d: float(d["closest_depth_m"]))
+    return with_depth[: max(0, int(limit))]
+
+
+def format_heading_phrase(bearing_deg: float) -> str:
+    if abs(bearing_deg) <= 7.5:
+        return "straight ahead"
+    side = "left" if bearing_deg < 0 else "right"
+    return f"{abs(bearing_deg):.0f} degrees {side}"
+
+
+def speak_detection_summary(
+    detections: list[dict],
+    enabled: bool,
+    rate_wpm: int,
+    pause_s: float,
+) -> None:
+    if not enabled:
+        return
+    if pyttsx3 is None:
+        print("Speech requested, but pyttsx3 is not installed. Run: pip install pyttsx3")
+        return
+    if not detections:
+        return
+
+    engine = pyttsx3.init()
+    engine.setProperty("rate", int(rate_wpm))
+    if pause_s > 0:
+        engine.setProperty("pause", float(pause_s))
+
+    path_instruction = choose_path_instruction(detections)
+    engine.say(f"Path suggestion: {path_instruction}.")
+
+    closest = pick_closest_detections(detections, limit=2)
+    if not closest:
+        engine.say("No reliable distance readings for nearby objects.")
+    else:
+        for det in closest:
+            label = det.get("class", "object")
+            bearing = float(det.get("bearing_deg", 0.0))
+            heading = format_heading_phrase(bearing)
+            depth = float(det["closest_depth_m"])
+            speech = f"{label}. Distance {depth:.2f} meters. Heading {heading}."
+            engine.say(speech)
+
+    engine.runAndWait()
 
 
 def detect_objects_and_disparity(
@@ -327,6 +428,23 @@ def build_arg_parser():
         action="store_true",
         help="Display result window.",
     )
+    parser.add_argument(
+        "--speak",
+        action="store_true",
+        help="Speak detected object, direction, and depth using text-to-speech.",
+    )
+    parser.add_argument(
+        "--speech-rate",
+        type=int,
+        default=175,
+        help="Speech rate in words per minute (used when --speak is enabled).",
+    )
+    parser.add_argument(
+        "--speech-pause",
+        type=float,
+        default=0.0,
+        help="Optional pause between utterances in seconds (when supported).",
+    )
     return parser
 
 
@@ -430,6 +548,13 @@ def main():
             print("Metric depth not computed. Provide --focal-px and --baseline-m.")
     else:
         print("Right image not provided; skipped disparity generation.")
+
+    speak_detection_summary(
+        detections=detections,
+        enabled=args.speak,
+        rate_wpm=args.speech_rate,
+        pause_s=args.speech_pause,
+    )
 
     if args.show:
         cv2.imshow("YOLO Segmentation", annotated)
