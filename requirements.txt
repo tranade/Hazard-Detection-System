@@ -2,4 +2,5 @@ numpy
 opencv-python
 ultralytics
 pyttsx3
-pyrealsense2
+gTTS
+playsound==1.2.2

@@ -1,6 +1,7 @@
 import argparse
 import json
 import re
+import tempfile
 import time
 from pathlib import Path
 
@@ -12,6 +13,16 @@ try:
     import pyttsx3
 except Exception:  # pragma: no cover - optional runtime dependency
     pyttsx3 = None
+
+try:
+    from gtts import gTTS
+except Exception:  # pragma: no cover - optional runtime dependency
+    gTTS = None
+
+try:
+    from playsound import playsound
+except Exception:  # pragma: no cover - optional runtime dependency
+    playsound = None
 
 try:
     import pyrealsense2 as rs
@@ -239,9 +250,10 @@ def choose_path_instruction(detections: list[dict]) -> str:
             right_min = min(right_min, depth)
             right_risk += risk
 
-    front_blocked = front_min < 1.5
-    left_blocked = left_min < 1.2
-    right_blocked = right_min < 1.2
+    # Conservative blocking thresholds: avoid unnecessary turns in open indoor scenes.
+    front_blocked = front_min < 0.85
+    left_blocked = left_min < 0.75
+    right_blocked = right_min < 0.75
 
     if front_blocked:
         if not left_blocked and not right_blocked:
@@ -252,8 +264,13 @@ def choose_path_instruction(detections: list[dict]) -> str:
             return "right"
         return "turn around"
 
-    if not left_blocked and not right_blocked and abs(left_risk - right_risk) > 0.05:
-        return "left" if left_risk < right_risk else "right"
+    if not left_blocked and not right_blocked:
+        nearest_any = min(front_min, left_min, right_min)
+        risk_gap = abs(left_risk - right_risk)
+        # Only bias left/right when a nearby obstacle creates a strong side imbalance.
+        if nearest_any < 1.1 and risk_gap > 0.60:
+            return "left" if left_risk < right_risk else "right"
+        return "straight"
     if left_blocked and not right_blocked:
         return "right"
     if right_blocked and not left_blocked:
@@ -278,44 +295,95 @@ def meters_to_inches(distance_m: float) -> float:
     return float(distance_m) * METER_TO_INCH
 
 
+def speak_lines_google_tts(lines: list[str], lang: str = "en") -> bool:
+    if gTTS is None or playsound is None:
+        return False
+    content = " ".join([line.strip() for line in lines if line and line.strip()])
+    if not content:
+        return True
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+        gTTS(text=content, lang=lang, slow=False).save(str(tmp_path))
+        playsound(str(tmp_path))
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return True
+    except Exception as exc:
+        print(f"Google TTS failed, falling back to local speech: {exc}")
+        return False
+
+
 def speak_detection_summary(
     detections: list[dict],
     enabled: bool,
     rate_wpm: int,
     pause_s: float,
+    tts_engine: str = "google",
 ) -> None:
     if not enabled:
         return
+    lines: list[str] = []
+    if not detections:
+        lines.append("I don't see any nearby obstacles right now.")
+    else:
+        path_instruction = choose_path_instruction(detections)
+        direction_phrases = {
+            "left": "A safer path looks open on your left.",
+            "right": "A safer path looks open on your right.",
+            "straight": "The path ahead looks mostly clear.",
+            "turn around": "The path ahead looks blocked. It's best to turn around.",
+        }
+        lines.append(direction_phrases.get(path_instruction, f"Suggested direction is {path_instruction}."))
+
+        closest = pick_closest_detections(detections, limit=2)
+        if not closest:
+            lines.append("I found objects, but I couldn't get reliable distance readings.")
+        else:
+            lines.append(
+                f"I'll call out the {len(closest)} closest object{'s' if len(closest) != 1 else ''}."
+            )
+            for det in closest:
+                label = det.get("class", "object")
+                bearing = float(det.get("bearing_deg", 0.0))
+                heading = format_heading_phrase(bearing)
+                depth = float(det["closest_depth_m"])
+                depth_in = meters_to_inches(depth)
+                lines.append(f"There's a {label} about {depth_in:.1f} inches away, {heading}.")
+
+    if tts_engine == "google":
+        if speak_lines_google_tts(lines):
+            return
+        print("Google TTS dependencies missing. Install: pip install gTTS playsound")
+
     if pyttsx3 is None:
-        print("Speech requested, but pyttsx3 is not installed. Run: pip install pyttsx3")
+        print("Local speech unavailable. Install: pip install pyttsx3")
         return
 
     engine = pyttsx3.init()
     engine.setProperty("rate", int(rate_wpm))
     if pause_s > 0:
         engine.setProperty("pause", float(pause_s))
+    try:
+        voices = engine.getProperty("voices") or []
+        preferred_keywords = ("zira", "samantha", "aria", "jenny", "david", "mark")
+        chosen_voice_id = None
+        for voice in voices:
+            voice_text = f"{getattr(voice, 'name', '')} {getattr(voice, 'id', '')}".lower()
+            if any(k in voice_text for k in preferred_keywords):
+                chosen_voice_id = voice.id
+                break
+        if chosen_voice_id is None and voices:
+            chosen_voice_id = voices[0].id
+        if chosen_voice_id is not None:
+            engine.setProperty("voice", chosen_voice_id)
+    except Exception:
+        pass
 
-    if not detections:
-        engine.say("No objects detected.")
-        engine.runAndWait()
-        return
-
-    path_instruction = choose_path_instruction(detections)
-    engine.say(f"Path suggestion: {path_instruction}.")
-
-    closest = pick_closest_detections(detections, limit=2)
-    if not closest:
-        engine.say("No reliable distance readings for nearby objects.")
-    else:
-        for det in closest:
-            label = det.get("class", "object")
-            bearing = float(det.get("bearing_deg", 0.0))
-            heading = format_heading_phrase(bearing)
-            depth = float(det["closest_depth_m"])
-            depth_in = meters_to_inches(depth)
-            speech = f"{label}. Distance {depth_in:.1f} inches. Heading {heading}."
-            engine.say(speech)
-
+    for line in lines:
+        engine.say(line)
     engine.runAndWait()
 
 
@@ -572,6 +640,12 @@ def build_arg_parser():
         default=0.0,
         help="Optional pause between utterances in seconds (when supported).",
     )
+    parser.add_argument(
+        "--tts-engine",
+        choices=["google", "local"],
+        default="google",
+        help="Speech engine: 'google' (gTTS) or 'local' (pyttsx3 fallback).",
+    )
     return parser
 
 
@@ -694,6 +768,7 @@ def main():
             enabled=args.speak,
             rate_wpm=args.speech_rate,
             pause_s=args.speech_pause,
+            tts_engine=args.tts_engine,
         )
 
         if args.show:
