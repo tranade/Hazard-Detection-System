@@ -295,6 +295,32 @@ def meters_to_inches(distance_m: float) -> float:
     return float(distance_m) * METER_TO_INCH
 
 
+def choose_navigation_phrase(detections: list[dict], path_instruction: str) -> str:
+    front_depths = []
+    for det in detections:
+        depth = det.get("closest_depth_m")
+        bearing = det.get("bearing_deg")
+        if depth is None or bearing is None:
+            continue
+        if abs(float(bearing)) <= 15.0:
+            front_depths.append(float(depth))
+    front_min = min(front_depths) if front_depths else float("inf")
+
+    if path_instruction == "straight":
+        return "Keep going straight."
+    if path_instruction == "left":
+        return "Turn left." if front_min < 0.65 else "Turn slightly left."
+    if path_instruction == "right":
+        return "Turn right." if front_min < 0.65 else "Turn slightly right."
+    return "Turn right."
+
+
+def heading_side_label(bearing_deg: float) -> str:
+    if abs(bearing_deg) <= 7.5:
+        return "ahead"
+    return "left" if bearing_deg < 0 else "right"
+
+
 def speak_lines_google_tts(lines: list[str], lang: str = "en") -> bool:
     if gTTS is None or playsound is None:
         return False
@@ -327,31 +353,31 @@ def speak_detection_summary(
         return
     lines: list[str] = []
     if not detections:
-        lines.append("I don't see any nearby obstacles right now.")
+        lines.append("Keep going straight.")
+        lines.append("No nearby obstacles.")
     else:
         path_instruction = choose_path_instruction(detections)
-        direction_phrases = {
-            "left": "A safer path looks open on your left.",
-            "right": "A safer path looks open on your right.",
-            "straight": "The path ahead looks mostly clear.",
-            "turn around": "The path ahead looks blocked. It's best to turn around.",
-        }
-        lines.append(direction_phrases.get(path_instruction, f"Suggested direction is {path_instruction}."))
+        lines.append(choose_navigation_phrase(detections, path_instruction))
 
         closest = pick_closest_detections(detections, limit=2)
         if not closest:
-            lines.append("I found objects, but I couldn't get reliable distance readings.")
+            lines.append("No reliable object distance.")
         else:
-            lines.append(
-                f"I'll call out the {len(closest)} closest object{'s' if len(closest) != 1 else ''}."
-            )
             for det in closest:
                 label = det.get("class", "object")
                 bearing = float(det.get("bearing_deg", 0.0))
-                heading = format_heading_phrase(bearing)
+                side = heading_side_label(bearing)
+                degrees = int(round(abs(bearing)))
                 depth = float(det["closest_depth_m"])
                 depth_in = meters_to_inches(depth)
-                lines.append(f"There's a {label} about {depth_in:.1f} inches away, {heading}.")
+                if side == "ahead":
+                    lines.append(
+                        f"There's a {label} ahead, {depth_in:.1f} inches away at {degrees} degrees."
+                    )
+                else:
+                    lines.append(
+                        f"There's a {label} to your {side}, {depth_in:.1f} inches away at {degrees} degrees."
+                    )
 
     if tts_engine == "google":
         if speak_lines_google_tts(lines):
@@ -631,7 +657,7 @@ def build_arg_parser():
     parser.add_argument(
         "--speech-rate",
         type=int,
-        default=175,
+        default=230,
         help="Speech rate in words per minute (used when --speak is enabled).",
     )
     parser.add_argument(
