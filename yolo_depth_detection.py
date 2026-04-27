@@ -1,5 +1,7 @@
 import argparse
 import json
+import re
+import time
 from pathlib import Path
 
 import cv2
@@ -21,6 +23,7 @@ DEFAULT_FOCAL_PX = 411.0
 DEFAULT_BASELINE_M = 0.018
 DEFAULT_PRINCIPAL_X = 320.818
 METER_TO_INCH = 39.37007874
+PAIR_CAPTURE_PATTERN = re.compile(r"^(?P<index>\d+)_(?P<side>left|right)\.png$")
 
 
 def resolve_existing_path(raw_path: str) -> Path:
@@ -87,6 +90,28 @@ def capture_stereo_pair_from_camera(save_dir: str = "camera_captures") -> tuple[
     finally:
         pipeline.stop()
         cv2.destroyAllWindows()
+
+
+def list_stereo_pairs(dataset_dir: str) -> list[tuple[Path, Path]]:
+    root = Path(dataset_dir)
+    if not root.exists():
+        raise FileNotFoundError(f"Dataset directory not found: {root}")
+
+    grouped: dict[int, dict[str, Path]] = {}
+    for image_path in root.glob("*.png"):
+        m = PAIR_CAPTURE_PATTERN.match(image_path.name)
+        if not m:
+            continue
+        idx = int(m.group("index"))
+        side = m.group("side")
+        grouped.setdefault(idx, {})[side] = image_path
+
+    pairs: list[tuple[Path, Path]] = []
+    for idx in sorted(grouped.keys()):
+        sides = grouped[idx]
+        if "left" in sides and "right" in sides:
+            pairs.append((sides["left"], sides["right"]))
+    return pairs
 
 
 def load_calibration_npz(calibration_path: str):
@@ -264,13 +289,16 @@ def speak_detection_summary(
     if pyttsx3 is None:
         print("Speech requested, but pyttsx3 is not installed. Run: pip install pyttsx3")
         return
-    if not detections:
-        return
 
     engine = pyttsx3.init()
     engine.setProperty("rate", int(rate_wpm))
     if pause_s > 0:
         engine.setProperty("pause", float(pause_s))
+
+    if not detections:
+        engine.say("No objects detected.")
+        engine.runAndWait()
+        return
 
     path_instruction = choose_path_instruction(detections)
     engine.say(f"Path suggestion: {path_instruction}.")
@@ -452,6 +480,17 @@ def build_arg_parser():
         help="Folder to save camera-captured stereo image pairs.",
     )
     parser.add_argument(
+        "--dataset-dir",
+        default=None,
+        help="Folder containing '<index>_left.png' and '<index>_right.png' pairs to process.",
+    )
+    parser.add_argument(
+        "--dataset-interval-s",
+        type=float,
+        default=10.0,
+        help="Seconds between each dataset pair when --dataset-dir is used.",
+    )
+    parser.add_argument(
         "--model",
         default="yolo11n-seg.pt",
         help="YOLO segmentation model path or name.",
@@ -538,13 +577,18 @@ def build_arg_parser():
 
 def main():
     args = build_arg_parser().parse_args()
+    if args.camera and args.dataset_dir:
+        raise ValueError("Use only one input mode: either --camera or --dataset-dir.")
+
     if args.camera:
         captured_left, captured_right = capture_stereo_pair_from_camera(args.camera_save_dir)
         args.image = str(captured_left)
         args.right_image = str(captured_right)
         args.speak = True
+    elif args.dataset_dir:
+        args.speak = True
     elif args.image is None:
-        raise ValueError("Provide --image, or use --camera to capture stereo images.")
+        raise ValueError("Provide --image, or use --camera / --dataset-dir.")
 
     calib = None
     if args.params_file is not None and str(args.params_file).strip() != "":
@@ -593,71 +637,94 @@ def main():
     if principal_x is None:
         principal_x = DEFAULT_PRINCIPAL_X
 
-    annotated, detections, disparity_vis, masked_disparity_vis, depth_map_m = detect_objects_and_disparity(
-        left_image_path=args.image,
-        right_image_path=args.right_image,
-        model_path=args.model,
-        conf_threshold=args.conf,
-        focal_px=focal_px,
-        baseline_m=baseline_m,
-        principal_x=principal_x,
-    )
-
     print(
         f"Using intrinsics/extrinsics: focal_px={focal_px:.3f}, principal_x={principal_x:.3f}, baseline_m={baseline_m:.6f}"
     )
 
-    output_path = Path(args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(output_path), annotated)
+    def run_once(left_path: str, right_path: str | None) -> None:
+        annotated, detections, disparity_vis, masked_disparity_vis, depth_map_m = detect_objects_and_disparity(
+            left_image_path=left_path,
+            right_image_path=right_path,
+            model_path=args.model,
+            conf_threshold=args.conf,
+            focal_px=focal_px,
+            baseline_m=baseline_m,
+            principal_x=principal_x,
+        )
 
-    print(f"Saved annotated image to: {output_path}")
-    if detections:
-        print("Detections:")
-        for d in detections:
-            closest_depth = d.get("closest_depth_m", None)
-            bearing_deg = d.get("bearing_deg", None)
-            bearing_txt = f"angle={bearing_deg:+.2f} deg | " if bearing_deg is not None else ""
-            if closest_depth is None:
-                print(
-                    f"  - {d['class']} | conf={d['confidence']:.2f} | {bearing_txt}bbox={d['bbox_xyxy']}"
-                )
-            else:
-                print(
-                    f"  - {d['class']} | conf={d['confidence']:.2f} | {bearing_txt}closest_depth={meters_to_inches(closest_depth):.1f} in | bbox={d['bbox_xyxy']}"
-                )
-    else:
-        print("No objects detected.")
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        cv2.imwrite(str(output_path), annotated)
+        print(f"Saved annotated image to: {output_path}")
 
-    if disparity_vis is not None and masked_disparity_vis is not None:
-        disp_output = Path(args.disp_output)
-        disp_output.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(disp_output), disparity_vis)
-        print(f"Saved full disparity map to: {disp_output}")
+        if detections:
+            print("Detections:")
+            for d in detections:
+                closest_depth = d.get("closest_depth_m", None)
+                bearing_deg = d.get("bearing_deg", None)
+                bearing_txt = f"angle={bearing_deg:+.2f} deg | " if bearing_deg is not None else ""
+                if closest_depth is None:
+                    print(
+                        f"  - {d['class']} | conf={d['confidence']:.2f} | {bearing_txt}bbox={d['bbox_xyxy']}"
+                    )
+                else:
+                    print(
+                        f"  - {d['class']} | conf={d['confidence']:.2f} | {bearing_txt}closest_depth={meters_to_inches(closest_depth):.1f} in | bbox={d['bbox_xyxy']}"
+                    )
+        else:
+            print("No objects detected.")
 
-        masked_disp_output = Path(args.masked_disp_output)
-        masked_disp_output.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(masked_disp_output), masked_disparity_vis)
-        print(f"Saved masked disparity map to: {masked_disp_output}")
-        if depth_map_m is None:
-            print("Metric depth not computed. Provide --focal-px and --baseline-m.")
-    else:
-        print("Right image not provided; skipped disparity generation.")
-
-    speak_detection_summary(
-        detections=detections,
-        enabled=args.speak,
-        rate_wpm=args.speech_rate,
-        pause_s=args.speech_pause,
-    )
-
-    if args.show:
-        cv2.imshow("YOLO Segmentation", annotated)
         if disparity_vis is not None and masked_disparity_vis is not None:
-            cv2.imshow("Disparity (Full)", disparity_vis)
-            cv2.imshow("Disparity (YOLO Masks Only)", masked_disparity_vis)
-        cv2.waitKey(0)
-        cv2.destroyAllWindows()
+            disp_output = Path(args.disp_output)
+            disp_output.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(disp_output), disparity_vis)
+            print(f"Saved full disparity map to: {disp_output}")
+
+            masked_disp_output = Path(args.masked_disp_output)
+            masked_disp_output.parent.mkdir(parents=True, exist_ok=True)
+            cv2.imwrite(str(masked_disp_output), masked_disparity_vis)
+            print(f"Saved masked disparity map to: {masked_disp_output}")
+            if depth_map_m is None:
+                print("Metric depth not computed. Provide --focal-px and --baseline-m.")
+        else:
+            print("Right image not provided; skipped disparity generation.")
+
+        speak_detection_summary(
+            detections=detections,
+            enabled=args.speak,
+            rate_wpm=args.speech_rate,
+            pause_s=args.speech_pause,
+        )
+
+        if args.show:
+            cv2.imshow("YOLO Segmentation", annotated)
+            if disparity_vis is not None and masked_disparity_vis is not None:
+                cv2.imshow("Disparity (Full)", disparity_vis)
+                cv2.imshow("Disparity (YOLO Masks Only)", masked_disparity_vis)
+            cv2.waitKey(1)
+
+    if args.dataset_dir:
+        pairs = list_stereo_pairs(args.dataset_dir)
+        if not pairs:
+            raise RuntimeError(
+                f"No stereo pairs found in {args.dataset_dir}. Expected files like '1_left.png' and '1_right.png'."
+            )
+        print(
+            f"Dataset mode: found {len(pairs)} stereo pair(s) in {args.dataset_dir}. "
+            f"Processing one pair every {args.dataset_interval_s:.1f} seconds."
+        )
+        for i, (left_path, right_path) in enumerate(pairs, start=1):
+            print(f"[{i}/{len(pairs)}] Processing {left_path.name} + {right_path.name}")
+            run_once(str(left_path), str(right_path))
+            if i < len(pairs):
+                time.sleep(max(0.0, args.dataset_interval_s))
+        if args.show:
+            cv2.destroyAllWindows()
+    else:
+        run_once(args.image, args.right_image)
+        if args.show:
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
