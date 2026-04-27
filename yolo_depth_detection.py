@@ -11,6 +11,11 @@ try:
 except Exception:  # pragma: no cover - optional runtime dependency
     pyttsx3 = None
 
+try:
+    import pyrealsense2 as rs
+except Exception:  # pragma: no cover - optional runtime dependency
+    rs = None
+
 # Fallback values if no calibration file is provided/found.
 DEFAULT_FOCAL_PX = 411.0
 DEFAULT_BASELINE_M = 0.018
@@ -33,6 +38,54 @@ def load_bgr_image(path_str: str):
     if image is None:
         raise FileNotFoundError(f"Could not read image: {file_path}")
     return image
+
+
+def capture_stereo_pair_from_camera(save_dir: str = "camera_captures") -> tuple[Path, Path]:
+    if rs is None:
+        raise RuntimeError(
+            "Camera capture requested, but pyrealsense2 is not installed. "
+            "Install with: pip install pyrealsense2"
+        )
+
+    output_dir = Path(save_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    capture_idx = len(list(output_dir.glob("*_left.png"))) + 1
+
+    pipeline = rs.pipeline()
+    config = rs.config()
+    config.enable_stream(rs.stream.infrared, 1, 640, 480, rs.format.y8, 30)
+    config.enable_stream(rs.stream.infrared, 2, 640, 480, rs.format.y8, 30)
+    pipeline.start(config)
+
+    print("Camera mode enabled.")
+    print("Press SPACE to capture synchronized left/right images, or Q to quit.")
+    try:
+        while True:
+            frames = pipeline.wait_for_frames()
+            left_frame = frames.get_infrared_frame(1)
+            right_frame = frames.get_infrared_frame(2)
+            if not left_frame or not right_frame:
+                continue
+
+            left_img = np.asanyarray(left_frame.get_data())
+            right_img = np.asanyarray(right_frame.get_data())
+            preview = np.hstack((left_img, right_img))
+            cv2.imshow("Left IR | Right IR", preview)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord(" "):
+                left_path = output_dir / f"{capture_idx}_left.png"
+                right_path = output_dir / f"{capture_idx}_right.png"
+                cv2.imwrite(str(left_path), left_img)
+                cv2.imwrite(str(right_path), right_img)
+                print(f"Captured left image: {left_path}")
+                print(f"Captured right image: {right_path}")
+                return left_path, right_path
+            if key == ord("q"):
+                raise RuntimeError("Camera capture cancelled by user.")
+    finally:
+        pipeline.stop()
+        cv2.destroyAllWindows()
 
 
 def load_calibration_npz(calibration_path: str):
@@ -140,27 +193,41 @@ def choose_path_instruction(detections: list[dict]) -> str:
     front_min = float("inf")
     left_min = float("inf")
     right_min = float("inf")
+    left_risk = 0.0
+    right_risk = 0.0
     for det in with_depth:
         depth = float(det["closest_depth_m"])
         bearing = float(det["bearing_deg"])
+        # Closer objects and headings near the centerline carry more path risk.
+        dist_weight = 1.0 / max(depth, 0.10)
+        center_weight = max(0.0, 1.0 - (abs(bearing) / 45.0))
+        risk = dist_weight * (1.0 + center_weight)
         if abs(bearing) <= 7.5:
             front_min = min(front_min, depth)
+            left_risk += risk
+            right_risk += risk
         elif bearing < 0:
             left_min = min(left_min, depth)
+            left_risk += risk
         else:
             right_min = min(right_min, depth)
+            right_risk += risk
 
     front_blocked = front_min < 1.5
     left_blocked = left_min < 1.2
     right_blocked = right_min < 1.2
 
     if front_blocked:
+        if not left_blocked and not right_blocked:
+            return "left" if left_risk <= right_risk else "right"
         if (left_min > right_min) and not left_blocked:
             return "left"
         if (right_min >= left_min) and not right_blocked:
             return "right"
         return "turn around"
 
+    if not left_blocked and not right_blocked and abs(left_risk - right_risk) > 0.05:
+        return "left" if left_risk < right_risk else "right"
     if left_blocked and not right_blocked:
         return "right"
     if right_blocked and not left_blocked:
@@ -357,11 +424,26 @@ def build_arg_parser():
             "Optional: provide right stereo image to generate full and YOLO-masked disparity maps."
         )
     )
-    parser.add_argument("--image", required=True, help="Path to left input image.")
+    parser.add_argument(
+        "--image",
+        required=False,
+        default=None,
+        help="Path to left input image. Optional when using --camera.",
+    )
     parser.add_argument(
         "--right-image",
         default=None,
         help="Path to right stereo image (optional for disparity).",
+    )
+    parser.add_argument(
+        "--camera",
+        action="store_true",
+        help="Use RealSense camera to capture left/right images on keypress.",
+    )
+    parser.add_argument(
+        "--camera-save-dir",
+        default="camera_captures",
+        help="Folder to save camera-captured stereo image pairs.",
     )
     parser.add_argument(
         "--model",
@@ -450,6 +532,13 @@ def build_arg_parser():
 
 def main():
     args = build_arg_parser().parse_args()
+    if args.camera:
+        captured_left, captured_right = capture_stereo_pair_from_camera(args.camera_save_dir)
+        args.image = str(captured_left)
+        args.right_image = str(captured_right)
+        args.speak = True
+    elif args.image is None:
+        raise ValueError("Provide --image, or use --camera to capture stereo images.")
 
     calib = None
     if args.params_file is not None and str(args.params_file).strip() != "":
