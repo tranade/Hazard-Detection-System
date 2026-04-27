@@ -20,6 +20,7 @@ except Exception:  # pragma: no cover - optional runtime dependency
 DEFAULT_FOCAL_PX = 411.0
 DEFAULT_BASELINE_M = 0.018
 DEFAULT_PRINCIPAL_X = 320.818
+METER_TO_INCH = 39.37007874
 
 
 def resolve_existing_path(raw_path: str) -> Path:
@@ -248,6 +249,10 @@ def format_heading_phrase(bearing_deg: float) -> str:
     return f"{abs(bearing_deg):.0f} degrees {side}"
 
 
+def meters_to_inches(distance_m: float) -> float:
+    return float(distance_m) * METER_TO_INCH
+
+
 def speak_detection_summary(
     detections: list[dict],
     enabled: bool,
@@ -279,7 +284,8 @@ def speak_detection_summary(
             bearing = float(det.get("bearing_deg", 0.0))
             heading = format_heading_phrase(bearing)
             depth = float(det["closest_depth_m"])
-            speech = f"{label}. Distance {depth:.2f} meters. Heading {heading}."
+            depth_in = meters_to_inches(depth)
+            speech = f"{label}. Distance {depth_in:.1f} inches. Heading {heading}."
             engine.say(speech)
 
     engine.runAndWait()
@@ -403,7 +409,7 @@ def detect_objects_and_disparity(
                     x1, y1, _, _ = det["bbox_xyxy"]
                     cv2.putText(
                         annotated,
-                        f"{closest_m:.2f} m",
+                        f"{meters_to_inches(closest_m):.1f} in",
                         (x1, y1 + 22),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.6,
@@ -618,7 +624,7 @@ def main():
                 )
             else:
                 print(
-                    f"  - {d['class']} | conf={d['confidence']:.2f} | {bearing_txt}closest_depth={closest_depth:.2f} m | bbox={d['bbox_xyxy']}"
+                    f"  - {d['class']} | conf={d['confidence']:.2f} | {bearing_txt}closest_depth={meters_to_inches(closest_depth):.1f} in | bbox={d['bbox_xyxy']}"
                 )
     else:
         print("No objects detected.")
